@@ -1,0 +1,167 @@
+"""
+Gold (XAUUSD) confirmation-candle alert bot -- SID 4, 7, 11
+Run this every 15 minutes (via GitHub Actions cron). No orders are placed;
+it only sends Telegram alerts.
+
+Needs 3 environment variables (set as GitHub repo Secrets):
+  APININJAS_KEY    - your API Ninjas key (https://api-ninjas.com/api/goldprice)
+  TELEGRAM_TOKEN   - your Telegram bot token (from @BotFather)
+  TELEGRAM_CHAT_ID - your Telegram chat id
+"""
+
+import os
+import json
+import requests
+from datetime import date
+
+APININJAS_KEY = os.environ.get('APININJAS_KEY', '')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+STATE_FILE = os.path.join(os.path.dirname(__file__), 'state.json')
+
+STRATEGIES = [
+    {'sid': 4,  'level': 'LDL', 'last_day_color': 'Green', 'position': 'Above'},
+    {'sid': 7,  'level': 'LDC', 'last_day_color': 'Red',   'position': 'Above'},
+    {'sid': 11, 'level': 'LDC', 'last_day_color': 'Green', 'position': 'On'},
+]
+
+MAX_TRADES_PER_DAY = 3
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {
+        'pending': [],
+        'last_seen_candle': None,
+        'day_counts': {},
+        'daily_levels': None,
+        'levels_date': None,
+    }
+
+
+def save_state(state):
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+        print('[WARN] Telegram not configured, message would be:', msg)
+        return
+    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    requests.post(url, data={'chat_id': TELEGRAM_CHAT, 'text': msg}, timeout=10)
+
+
+def fetch_candles(period, limit=5):
+    url = 'https://api.api-ninjas.com/v1/goldpricehistorical'
+    headers = {'X-Api-Key': APININJAS_KEY}
+    params = {'period': period}
+    r = requests.get(url, headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return sorted(data, key=lambda x: x['time'])[-limit:]
+
+
+def position_ok(candle_low, candle_high, level, position):
+    if position == 'Above':
+        return candle_low > level
+    if position == 'Below':
+        return candle_high < level
+    return candle_low <= level <= candle_high
+
+
+def check_once():
+    state = load_state()
+    today = date.today().isoformat()
+
+    if state.get('levels_date') != today:
+        daily = fetch_candles('1d', limit=3)
+        yesterday = daily[-2]
+        color = 'Green' if yesterday['close'] >= yesterday['open'] else 'Red'
+        state['daily_levels'] = {
+            'LDL': yesterday['low'],
+            'LDC': yesterday['close'],
+            'LDH': yesterday['high'],
+            'color': color,
+        }
+        state['levels_date'] = today
+        state['day_counts'] = {}
+        print(f'[INFO] New daily levels: {state["daily_levels"]}')
+
+    lvl = state['daily_levels']
+
+    candles = fetch_candles('15m', limit=5)
+    latest = candles[-1]
+
+    if state.get('last_seen_candle') == latest['time']:
+        print('[INFO] No new candle yet.')
+        save_state(state)
+        return
+
+    state['last_seen_candle'] = latest['time']
+    color = 'Green' if latest['close'] >= latest['open'] else 'Red'
+
+    latest_day = latest['time'][:10] if isinstance(latest['time'], str) else str(latest['time'])
+    state['pending'] = [p for p in state['pending'] if p.get('conf_day') == latest_day]
+
+    still_pending = []
+    for p in state['pending']:
+        sid = p['sid']
+        if latest['high'] >= p['conf_high']:
+            day_count = state['day_counts'].get(str(sid), 0)
+            if day_count < MAX_TRADES_PER_DAY:
+                entry = p['conf_high']
+                risk = entry - p['sl']
+                t1 = entry + risk * 1.6
+                t2 = entry + risk * 3.33
+                send_telegram(
+                    f"ENTRY SIGNAL -- Strategy {sid}\n"
+                    f"BUY breakout of {entry:.2f}\n"
+                    f"SL: {p['sl']:.2f}\n"
+                    f"Part1(70%) target: {t1:.2f}\nPart2(30%) target: {t2:.2f}\n"
+                    f"Move Part2 SL to breakeven ({entry:.2f}) once Part1 target hits."
+                )
+                state['day_counts'][str(sid)] = day_count + 1
+            else:
+                still_pending.append(p)
+        else:
+            still_pending.append(p)
+    state['pending'] = still_pending
+
+    for s in STRATEGIES:
+        sid = s['sid']
+        if state['day_counts'].get(str(sid), 0) >= MAX_TRADES_PER_DAY:
+            continue
+        if color != 'Green':
+            continue
+        if lvl['color'] != s['last_day_color']:
+            continue
+        level_val = lvl[s['level']]
+        if position_ok(latest['low'], latest['high'], level_val, s['position']):
+            already = any(
+                p['sid'] == sid and p['conf_time'] == latest['time']
+                for p in state['pending']
+            )
+            if not already:
+                state['pending'].append({
+                    'sid': sid,
+                    'conf_time': latest['time'],
+                    'conf_day': latest_day,
+                    'conf_high': latest['high'],
+                    'sl': latest['low'] - 5,
+                })
+                send_telegram(
+                    f"CONFIRMATION CANDLE -- Strategy {sid} "
+                    f"({s['level']}, {s['last_day_color']})\n"
+                    f"Candle High: {latest['high']:.2f}  Low: {latest['low']:.2f}\n"
+                    f"Watching for breakout above {latest['high']:.2f}..."
+                )
+
+    save_state(state)
+
+
+if __name__ == '__main__':
+    check_once()
