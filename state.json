@@ -13,12 +13,24 @@
       "high": 4050.699951,
       "low": 4050.699951,
       "close": 4050.699951
+    },
+    {
+      "time": "2026-07-24T04:15:00+00:00",
+      "open": 4029.300049,
+      "high": 4029.300049,
+      "low": 4029.300049,
+      "close": 4029.300049
     }
   ],
   "pending": [],
-  "last_bucket": null,
+  "last_bucket": "2026-07-24T04:15:00+00:00",
   "last_processed_bucket": null,
   "day_counts": {},
-  "daily_levels": null,
-  "levels_date": null
+  "daily_levels": {
+    "LDL": 4049.0,
+    "LDC": 4050.699951,
+    "LDH": 4050.699951,
+    "color": "Green"
+  },
+  "levels_date": "2026-07-24"
 }
